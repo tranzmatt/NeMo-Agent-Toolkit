@@ -33,7 +33,7 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     export TZ=Etc/UTC && \
     apt-get update && \
     apt upgrade -y && \
-    apt-get install --no-install-recommends  -y ca-certificates tzdata && \
+    apt-get install --no-install-recommends  -y ca-certificates tzdata gcc g++ && \
     apt clean && \
     update-ca-certificates
 
