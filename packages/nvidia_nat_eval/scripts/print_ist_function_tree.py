@@ -105,8 +105,17 @@ def _print_tree(nodes: dict[str, NodeStats]) -> None:
     for child_ids in by_parent.values():
         child_ids.sort(key=lambda fid: nodes[fid].function_name)
 
-    roots = [fid for fid, node in nodes.items() if (node.parent_id in (None, "", "root")) and fid != "root"]
+    roots = [
+        fid for fid, node in nodes.items()
+        if (
+            fid != "root" and (
+                node.parent_id in (None, "", "root") or
+                node.parent_id not in nodes
+            ))
+    ]
     roots.sort(key=lambda fid: nodes[fid].function_name)
+
+    covered: set[str] = set()
 
     def rec(function_id: str, prefix: str, is_last: bool, visited: set[str]) -> None:
         if function_id in visited:
@@ -115,6 +124,7 @@ def _print_tree(nodes: dict[str, NodeStats]) -> None:
             return
         visited = set(visited)
         visited.add(function_id)
+        covered.add(function_id)
 
         node = nodes[function_id]
         branch = "└─ " if is_last else "├─ "
@@ -136,6 +146,11 @@ def _print_tree(nodes: dict[str, NodeStats]) -> None:
         roots = ["root"]
     for i, root_id in enumerate(roots):
         rec(root_id, "", i == len(roots) - 1, set())
+
+    # Ensure disconnected/cyclic components are still surfaced as top-level entries.
+    remaining_roots = sorted((fid for fid in nodes if fid not in covered), key=lambda fid: nodes[fid].function_name)
+    for i, root_id in enumerate(remaining_roots):
+        rec(root_id, "", i == len(remaining_roots) - 1, set())
 
 
 def main() -> None:
