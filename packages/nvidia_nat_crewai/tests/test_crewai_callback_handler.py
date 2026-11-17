@@ -123,3 +123,191 @@ async def test_crewai_handler_pairs_start_and_end_events(reactive_stream: Subjec
     assert results[0].UUID == results[1].UUID
     assert results[2].UUID == results[3].UUID
     assert results[3].usage_info.token_usage.total_tokens == 5
+
+
+def _completion_kwargs(mock_response: str) -> dict:
+    """Keyword arguments for a ``litellm.completion`` call answered by LiteLLM's ``mock_response``."""
+    return {
+        "model": "nvidia_nim/meta/llama-3.1-8b-instruct",
+        "messages": [{
+            "role": "user", "content": "question"
+        }],
+        "api_key": "test-key",
+        "mock_response": mock_response,
+    }
+
+
+def test_crewai_handler_failed_llm_call_ends_llm_step(reactive_stream: Subject):
+    """A failed ``litellm.completion`` call closes its LLM step, and the caller still gets the provider's error."""
+    import litellm
+
+    from nat.plugins.crewai.crewai_callback_handler import CrewAIProfilerHandler
+
+    results = []
+    _ = reactive_stream.subscribe(results.append)
+    context = Context.get()
+    initial_span = context.active_span_id
+
+    handler = CrewAIProfilerHandler()
+    handler._original_llm_call = litellm.completion
+    wrapped_llm_call = handler._llm_call_monkey_patch()
+
+    with pytest.raises(litellm.RateLimitError):
+        wrapped_llm_call(**_completion_kwargs("litellm.RateLimitError"))
+
+    assert [step.event_type for step in results] == [IntermediateStepType.LLM_START, IntermediateStepType.LLM_END]
+    assert results[0].UUID == results[1].UUID
+    assert results[1].payload.name == "nvidia_nim/meta/llama-3.1-8b-instruct"
+    assert results[1].payload.data.output == ""
+    assert results[1].usage_info.token_usage.total_tokens == 0
+    assert results[1].span_event_timestamp <= results[0].event_timestamp
+    assert context.active_span_id == initial_span
+
+    # The next call is not nested under the failed one
+    wrapped_llm_call(**_completion_kwargs("Hi there"))
+
+    assert [step.event_type for step in results[2:]] == [IntermediateStepType.LLM_START, IntermediateStepType.LLM_END]
+    assert results[2].parent_id == initial_span
+    assert results[3].payload.data.output == "Hi there"
+    assert results[3].usage_info.token_usage.total_tokens > 0
+    assert results[3].span_event_timestamp <= results[2].event_timestamp
+    assert context.active_span_id == initial_span
+
+
+def test_crewai_handler_failed_tool_call_ends_tool_step(reactive_stream: Subject):
+    """A failed ``ToolUsage._use`` call closes its tool step, and the caller still gets the tool's error."""
+    from types import SimpleNamespace
+
+    from nat.plugins.crewai.crewai_callback_handler import CrewAIProfilerHandler
+
+    results = []
+    _ = reactive_stream.subscribe(results.append)
+    context = Context.get()
+    initial_span = context.active_span_id
+
+    def failing_tool_use(_instance, *args, **kwargs):
+        raise ValueError("search failed")
+
+    handler = CrewAIProfilerHandler()
+    handler._original_tool_use = failing_tool_use
+
+    with pytest.raises(ValueError, match="search failed"):
+        handler._tool_use_monkey_patch()(object(), tool=SimpleNamespace(name="search"))
+
+    assert [step.event_type for step in results] == [IntermediateStepType.TOOL_START, IntermediateStepType.TOOL_END]
+    assert results[0].UUID == results[1].UUID
+    assert results[1].payload.name == "search"
+    assert results[1].payload.data.output == ""
+    assert results[1].span_event_timestamp <= results[0].event_timestamp
+    assert context.active_span_id == initial_span
+
+
+def test_crewai_handler_end_event_error_keeps_provider_error(reactive_stream: Subject, monkeypatch):
+    """An error while recording the end of a failed call does not replace the provider's error."""
+    import litellm
+
+    from nat.plugins.crewai.crewai_callback_handler import CrewAIProfilerHandler
+
+    handler = CrewAIProfilerHandler()
+    handler._original_llm_call = litellm.completion
+    original_push = handler.step_manager.push_intermediate_step
+
+    def push_intermediate_step(payload: IntermediateStepPayload) -> None:
+        if payload.event_type == IntermediateStepType.LLM_END:
+            raise RuntimeError("exporter failed")
+        original_push(payload)
+
+    monkeypatch.setattr(handler.step_manager, "push_intermediate_step", push_intermediate_step)
+
+    with pytest.raises(litellm.RateLimitError):
+        handler._llm_call_monkey_patch()(**_completion_kwargs("litellm.RateLimitError"))
+
+
+def _streamed_completion_kwargs() -> dict:
+    """Keyword arguments for a streamed ``litellm.completion`` call answered by LiteLLM's ``mock_response``."""
+    return {
+        "model": "openai/gpt-4o-mini",
+        "messages": [{
+            "role": "user", "content": "question"
+        }],
+        "api_key": "test-key",
+        "mock_response": "Hi there",
+        "stream": True,
+    }
+
+
+def test_crewai_handler_streamed_llm_call_records_output(reactive_stream: Subject):
+    """A streamed ``litellm.completion`` call records LLM_END with its output and usage once the stream is read."""
+    import litellm
+
+    from nat.plugins.crewai.crewai_callback_handler import CrewAIProfilerHandler
+
+    results = []
+    _ = reactive_stream.subscribe(results.append)
+
+    handler = CrewAIProfilerHandler()
+    handler._original_llm_call = litellm.completion
+
+    stream = handler._llm_call_monkey_patch()(**_streamed_completion_kwargs(), stream_options={"include_usage": True})
+
+    # The end event is recorded only after the caller has read the stream
+    assert [step.event_type for step in results] == [IntermediateStepType.LLM_START]
+    text = "".join([chunk.choices[0].delta.content or "" for chunk in stream if chunk.choices])
+    assert text == "Hi there"
+
+    assert [step.event_type for step in results] == [IntermediateStepType.LLM_START, IntermediateStepType.LLM_END]
+    start, end = results
+    assert end.UUID == start.UUID
+    assert end.payload.data.output == "Hi there"
+    assert end.payload.metadata.chat_responses["message"]["content"] == "Hi there"
+    assert end.usage_info.token_usage.completion_tokens > 0
+    assert end.usage_info.token_usage.total_tokens > 0
+    assert end.span_event_timestamp <= start.event_timestamp
+
+
+def test_crewai_handler_closed_stream_ends_llm_step(reactive_stream: Subject):
+    """Closing a streamed call before it is exhausted records LLM_END with the chunks received so far."""
+    import litellm
+
+    from nat.plugins.crewai.crewai_callback_handler import CrewAIProfilerHandler
+
+    results = []
+    _ = reactive_stream.subscribe(results.append)
+
+    handler = CrewAIProfilerHandler()
+    handler._original_llm_call = litellm.completion
+
+    stream = handler._llm_call_monkey_patch()(**_streamed_completion_kwargs())
+    first = next(stream)
+    stream.close()
+    stream.close()
+
+    assert [step.event_type for step in results] == [IntermediateStepType.LLM_START, IntermediateStepType.LLM_END]
+    assert results[1].payload.data.output == first.choices[0].delta.content
+
+
+def test_crewai_handler_failed_stream_ends_llm_step(reactive_stream: Subject):
+    """A stream that fails while it is read records LLM_END, and the caller still gets the stream's error."""
+    import litellm
+
+    from nat.plugins.crewai.crewai_callback_handler import CrewAIProfilerHandler
+
+    results = []
+    _ = reactive_stream.subscribe(results.append)
+
+    def failing_stream(**kwargs):
+        stream = litellm.completion(**kwargs)
+        yield next(stream)
+        raise litellm.APIConnectionError(message="connection reset", llm_provider="openai", model="gpt-4o-mini")
+
+    handler = CrewAIProfilerHandler()
+    handler._original_llm_call = failing_stream
+
+    stream = handler._llm_call_monkey_patch()(**_streamed_completion_kwargs())
+    first = next(stream)
+    with pytest.raises(litellm.APIConnectionError):
+        next(stream)
+
+    assert [step.event_type for step in results] == [IntermediateStepType.LLM_START, IntermediateStepType.LLM_END]
+    assert results[0].UUID == results[1].UUID
+    assert results[1].payload.data.output == first.choices[0].delta.content
